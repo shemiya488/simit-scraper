@@ -21,7 +21,7 @@ async function getBrowser() {
             headless: "new",
             args: [
                 "--no-sandbox",
-                "--disable-setuid-sandbox", 
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
@@ -39,83 +39,76 @@ async function consultarSIMIT(documento) {
     const page = await b.newPage();
 
     try {
-        // Evitar detección de bot
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-CO', 'es', 'en'] });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-CO', 'es'] });
         });
 
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         await page.setViewport({ width: 1280, height: 720 });
 
         let simitData = null;
-        let urlsVistas = [];
 
         page.on('response', async (response) => {
             const url = response.url();
-            urlsVistas.push(url);
-            try {
-                const ct = response.headers()['content-type'] || '';
-                if (ct.includes('json')) {
-                    const json = await response.json();
-                    if (json && (
-                        json.comparendos !== undefined || 
-                        json.multas !== undefined ||
-                        (json.data && typeof json.data === 'object' && (
-                            json.data.comparendos !== undefined || 
-                            json.data.multas !== undefined ||
-                            json.data.cantMultasPagar !== undefined
-                        ))
-                    )) {
-                        console.log('✅ Datos encontrados en:', url);
-                        simitData = json;
+            if (url.includes('estadocuenta') || url.includes('consulta')) {
+                try {
+                    const ct = response.headers()['content-type'] || '';
+                    if (ct.includes('json')) {
+                        const json = await response.json();
+                        if (json && (
+                            json.comparendos !== undefined ||
+                            json.multas !== undefined ||
+                            (json.data && typeof json.data === 'object' && (
+                                json.data.comparendos !== undefined ||
+                                json.data.multas !== undefined ||
+                                json.data.cantMultasPagar !== undefined
+                            ))
+                        )) {
+                            console.log('✅ Datos SIMIT interceptados');
+                            simitData = json;
+                        }
                     }
-                }
-            } catch(e) {}
+                } catch(e) {}
+            }
         });
 
-        console.log('Navegando al SIMIT...');
-        await page.goto("https://fcm.org.co/simit/#/estado-cuenta", {
-            waitUntil: "networkidle2",
-            timeout: 30000
-        });
+        // Ir directo a la URL con el documento
+        const url = `https://fcm.org.co/simit/#/estado-cuenta?documento=${documento}`;
+        console.log('Navegando a:', url);
 
-        console.log('Página cargada, buscando input...');
+        await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
         await new Promise(r => setTimeout(r, 3000));
 
-        // Tomar screenshot para debug
-        const screenshot = await page.screenshot({ encoding: 'base64' });
-        console.log('Screenshot tomado, tamaño:', screenshot.length);
+        // Ver si hay captcha
+        const tieneCaptcha = await page.evaluate(() => {
+            return document.body.innerHTML.includes('captcha') || 
+                   document.body.innerHTML.includes('qxcaptcha') ||
+                   !!document.querySelector('iframe[src*="captcha"]');
+        });
+        console.log('Tiene captcha:', tieneCaptcha);
 
-        // Ver el HTML actual
-        const html = await page.content();
-        console.log('HTML length:', html.length);
-        console.log('Inputs encontrados:', (html.match(/<input/g) || []).length);
-
-        // Intentar llenar el input
-        const inputFilled = await page.evaluate((doc) => {
-            const inputs = [...document.querySelectorAll('input')].filter(i => 
-                i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio'
-            );
-            console.log('Inputs visibles:', inputs.length);
-            if (inputs.length > 0) {
-                inputs[0].focus();
-                inputs[0].value = doc;
-                ['input','change','keyup'].forEach(ev => 
-                    inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
+        if (!tieneCaptcha) {
+            // Buscar y llenar el input
+            await page.evaluate((doc) => {
+                const inputs = [...document.querySelectorAll('input')].filter(i =>
+                    i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio' &&
+                    !i.name?.includes('email') && !i.name?.includes('password')
                 );
-                return true;
-            }
-            return false;
-        }, documento);
+                if (inputs.length > 0) {
+                    inputs[0].focus();
+                    inputs[0].value = doc;
+                    ['input', 'change', 'keyup'].forEach(ev =>
+                        inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
+                    );
+                }
+            }, documento);
 
-        console.log('Input llenado:', inputFilled);
-        await new Promise(r => setTimeout(r, 1000));
-        await page.keyboard.press('Enter');
-        console.log('Enter presionado, esperando respuesta...');
+            await new Promise(r => setTimeout(r, 500));
+            await page.keyboard.press('Enter');
+        }
 
-        // Esperar datos
+        // Esperar datos hasta 20 segundos
         await new Promise((resolve) => {
             const interval = setInterval(() => {
                 if (simitData) { clearInterval(interval); resolve(); }
@@ -123,11 +116,13 @@ async function consultarSIMIT(documento) {
             setTimeout(() => { clearInterval(interval); resolve(); }, 20000);
         });
 
-        console.log('URLs vistas:', urlsVistas.filter(u => u.includes('simit') || u.includes('fcm')));
         await page.close();
 
         if (!simitData) {
-            return { ok: false, error: "SIMIT no respondió", urls: urlsVistas.slice(-10) };
+            return { 
+                ok: false, 
+                error: tieneCaptcha ? "SIMIT bloqueó con CAPTCHA — intenta de nuevo en unos minutos" : "SIMIT no respondió a tiempo"
+            };
         }
 
         const rawData = simitData.data || simitData;
@@ -162,7 +157,7 @@ async function consultarSIMIT(documento) {
 
     } catch (error) {
         await page.close().catch(() => {});
-        if (!browser.isConnected()) browser = null;
+        if (browser && !browser.isConnected()) browser = null;
         throw error;
     }
 }
@@ -179,7 +174,7 @@ app.post("/api/simit", async (req, res) => {
     }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper debug" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v5" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Scraper debug en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Scraper v5 en puerto ${PORT}`));
