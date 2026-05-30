@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const puppeteer = require("puppeteer");
 
 const app = express();
@@ -14,111 +13,169 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-app.post("/api/simit", async (req, res) => {
-    const documento = req.body.filtro || req.body.documento || req.body.placa;
-    if (!documento) return res.status(400).json({ ok: false, error: "Documento requerido" });
+// =====================================================
+// POOL DE NAVEGADORES — Chrome siempre listo
+// =====================================================
+let browser = null;
+const queue = [];
+let processing = false;
 
-    let browser;
-    try {
+async function getBrowser() {
+    if (!browser || !browser.isConnected()) {
+        console.log("Iniciando Chrome...");
         browser = await puppeteer.launch({
             headless: "new",
-            args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--window-size=1280,720"]
         });
+        console.log("Chrome listo.");
+    }
+    return browser;
+}
 
-        const page = await browser.newPage();
+// Pre-calentar Chrome al arrancar
+getBrowser().catch(console.error);
+
+async function consultarSIMIT(documento) {
+    const b = await getBrowser();
+    const page = await b.newPage();
+
+    try {
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
 
-        // Interceptar la respuesta del SIMIT directamente
+        // Interceptar respuesta del SIMIT
         let simitData = null;
-        page.on('response', async (response) => {
+        const responseHandler = async (response) => {
             const url = response.url();
-            if (url.includes('estadocuenta/consulta') || url.includes('simit/microservices')) {
+            if (url.includes('consulta') && url.includes('simit')) {
                 try {
-                    const json = await response.json();
-                    simitData = json;
+                    const ct = response.headers()['content-type'] || '';
+                    if (ct.includes('json')) {
+                        const json = await response.json();
+                        if (json && (json.comparendos !== undefined || json.multas !== undefined ||
+                            (json.data && (json.data.comparendos !== undefined || json.data.multas !== undefined)))) {
+                            simitData = json;
+                        }
+                    }
                 } catch(e) {}
             }
-        });
+        };
+        page.on('response', responseHandler);
 
+        // Navegar a la página
         await page.goto("https://fcm.org.co/simit/#/estado-cuenta", {
             waitUntil: "networkidle2",
-            timeout: 30000
+            timeout: 25000
         });
 
-        // Esperar campo de búsqueda
-        await page.waitForSelector('input', { timeout: 15000 });
+        // Esperar que cargue el input
+        await page.waitForSelector('input', { timeout: 10000 });
+        await new Promise(r => setTimeout(r, 1500));
 
-        // Encontrar y llenar el input
+        // Llenar el campo y buscar
         await page.evaluate((doc) => {
-            const inputs = document.querySelectorAll('input');
-            for (const input of inputs) {
-                if (input.type !== 'hidden' && input.type !== 'checkbox') {
-                    input.value = doc;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                    break;
-                }
+            const inputs = [...document.querySelectorAll('input')].filter(i => 
+                i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio'
+            );
+            if (inputs[0]) {
+                inputs[0].focus();
+                inputs[0].value = doc;
+                ['input','change','keyup'].forEach(ev => 
+                    inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
+                );
             }
         }, documento);
 
         await new Promise(r => setTimeout(r, 500));
-
-        // Presionar Enter o click en buscar
         await page.keyboard.press('Enter');
 
-        // Esperar respuesta del API interceptada o timeout
-        await new Promise(r => setTimeout(r, 12000));
+        // Esperar datos — máximo 18 segundos
+        await new Promise((resolve) => {
+            const interval = setInterval(() => {
+                if (simitData) { clearInterval(interval); resolve(); }
+            }, 300);
+            setTimeout(() => { clearInterval(interval); resolve(); }, 18000);
+        });
 
-        await browser.close();
+        page.off('response', responseHandler);
+        await page.close();
 
-        if (simitData) {
-            // Tenemos datos del API del SIMIT directamente
-            const rawData = simitData.data || simitData;
-            
-            // Normalizar comparendos
-            const comparendos = (rawData.comparendos || []).map(c => ({
-                tipo: c.tipoComparendo || c.tipo || 'Comparendo',
-                numero_comparendo: c.numeroComparendo || c.numero || '',
-                fecha_comparendo: c.fechaImposicion || c.fecha || '',
-                placa: c.placa || documento,
-                secretaria: c.secretaria || c.organismoTransito || '',
-                infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
-                estado: c.estadoComparendo || c.estado || '',
-                valor: c.valorComparendo || c.valor || 0,
-                valor_a_pagar: c.valorAPagar || c.totalAPagar || c.valor || 0,
-                notificacion: c.notificacion || ''
-            }));
+        if (!simitData) return { ok: false, error: "SIMIT no respondió a tiempo" };
 
-            // Normalizar multas
-            const multas = (rawData.multas || []).map(m => ({
-                tipo: 'Multa',
-                numero_comparendo: m.numeroMulta || m.numero || '',
-                fecha_comparendo: m.fechaResolucion || m.fecha || '',
-                placa: m.placa || documento,
-                secretaria: m.secretaria || '',
-                infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
-                estado: m.estadoMulta || m.estado || '',
-                valor: m.valorMulta || m.valor || 0,
-                valor_a_pagar: m.valorAPagar || m.totalAPagar || m.valor || 0,
-                notificacion: m.notificacion || ''
-            }));
+        const rawData = simitData.data || simitData;
+        const comparendos = (rawData.comparendos || []).map(c => ({
+            tipo: c.tipoComparendo || 'Comparendo',
+            numero_comparendo: c.numeroComparendo || '',
+            fecha_comparendo: c.fechaImposicion || '',
+            placa: c.placa || documento,
+            secretaria: c.secretaria || c.organismoTransito || '',
+            infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
+            estado: c.estadoComparendo || '',
+            valor: c.valorComparendo || 0,
+            valor_a_pagar: c.valorAPagar || c.totalAPagar || 0,
+            notificacion: c.notificacion || ''
+        }));
 
-            const resultados = [...comparendos, ...multas];
-            const status = resultados.length === 0 ? 'notfound' : 'ok';
+        const multas = (rawData.multas || []).map(m => ({
+            tipo: 'Multa',
+            numero_comparendo: m.numeroMulta || '',
+            fecha_comparendo: m.fechaResolucion || '',
+            placa: m.placa || documento,
+            secretaria: m.secretaria || '',
+            infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
+            estado: m.estadoMulta || '',
+            valor: m.valorMulta || 0,
+            valor_a_pagar: m.valorAPagar || 0,
+            notificacion: ''
+        }));
 
-            return res.json({ ok: true, status, data: resultados });
-        }
-
-        // Si no interceptamos datos, error
-        return res.status(500).json({ ok: false, error: "No se pudo obtener datos del SIMIT" });
+        const resultados = [...comparendos, ...multas];
+        return { ok: true, status: resultados.length === 0 ? 'notfound' : 'ok', data: resultados };
 
     } catch (error) {
-        if (browser) await browser.close();
-        return res.status(500).json({ ok: false, error: "Error: " + error.message });
+        await page.close().catch(() => {});
+        // Si Chrome murió, reiniciarlo
+        if (!browser.isConnected()) browser = null;
+        throw error;
     }
+}
+
+// Cola de consultas — procesar de a una para no sobrecargar
+async function processQueue() {
+    if (processing || queue.length === 0) return;
+    processing = true;
+    const { documento, resolve, reject } = queue.shift();
+    try {
+        const result = await consultarSIMIT(documento);
+        resolve(result);
+    } catch(e) {
+        reject(e);
+    } finally {
+        processing = false;
+        processQueue(); // Procesar siguiente
+    }
+}
+
+app.post("/api/simit", async (req, res) => {
+    const documento = req.body.filtro || req.body.documento || req.body.placa;
+    if (!documento) return res.status(400).json({ ok: false, error: "Documento requerido" });
+
+    // Agregar a la cola
+    const result = await new Promise((resolve, reject) => {
+        queue.push({ documento, resolve, reject });
+        processQueue();
+    }).catch(e => ({ ok: false, error: e.message }));
+
+    return res.json(result);
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v2" }));
+app.get("/", (req, res) => res.json({ 
+    status: "ok", 
+    message: "SIMIT Scraper v4 - Pool activo",
+    cola: queue.length,
+    chromeActivo: browser?.isConnected() || false
+}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Scraper v2 en puerto ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Scraper v4 en puerto ${PORT}`);
+});
