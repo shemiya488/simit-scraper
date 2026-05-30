@@ -13,26 +13,25 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// =====================================================
-// POOL DE NAVEGADORES — Chrome siempre listo
-// =====================================================
 let browser = null;
-const queue = [];
-let processing = false;
 
 async function getBrowser() {
     if (!browser || !browser.isConnected()) {
-        console.log("Iniciando Chrome...");
         browser = await puppeteer.launch({
             headless: "new",
-            args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--window-size=1280,720"]
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox", 
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,720"
+            ]
         });
-        console.log("Chrome listo.");
     }
     return browser;
 }
 
-// Pre-calentar Chrome al arrancar
 getBrowser().catch(console.error);
 
 async function consultarSIMIT(documento) {
@@ -40,66 +39,96 @@ async function consultarSIMIT(documento) {
     const page = await b.newPage();
 
     try {
-        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
-
-        // Interceptar respuesta del SIMIT
-        let simitData = null;
-        const responseHandler = async (response) => {
-            const url = response.url();
-            if (url.includes('consulta') && url.includes('simit')) {
-                try {
-                    const ct = response.headers()['content-type'] || '';
-                    if (ct.includes('json')) {
-                        const json = await response.json();
-                        if (json && (json.comparendos !== undefined || json.multas !== undefined ||
-                            (json.data && (json.data.comparendos !== undefined || json.data.multas !== undefined)))) {
-                            simitData = json;
-                        }
-                    }
-                } catch(e) {}
-            }
-        };
-        page.on('response', responseHandler);
-
-        // Navegar a la página
-        await page.goto("https://fcm.org.co/simit/#/estado-cuenta", {
-            waitUntil: "networkidle2",
-            timeout: 25000
+        // Evitar detección de bot
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-CO', 'es', 'en'] });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         });
 
-        // Esperar que cargue el input
-        await page.waitForSelector('input', { timeout: 10000 });
-        await new Promise(r => setTimeout(r, 1500));
+        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        await page.setViewport({ width: 1280, height: 720 });
 
-        // Llenar el campo y buscar
-        await page.evaluate((doc) => {
+        let simitData = null;
+        let urlsVistas = [];
+
+        page.on('response', async (response) => {
+            const url = response.url();
+            urlsVistas.push(url);
+            try {
+                const ct = response.headers()['content-type'] || '';
+                if (ct.includes('json')) {
+                    const json = await response.json();
+                    if (json && (
+                        json.comparendos !== undefined || 
+                        json.multas !== undefined ||
+                        (json.data && typeof json.data === 'object' && (
+                            json.data.comparendos !== undefined || 
+                            json.data.multas !== undefined ||
+                            json.data.cantMultasPagar !== undefined
+                        ))
+                    )) {
+                        console.log('✅ Datos encontrados en:', url);
+                        simitData = json;
+                    }
+                }
+            } catch(e) {}
+        });
+
+        console.log('Navegando al SIMIT...');
+        await page.goto("https://fcm.org.co/simit/#/estado-cuenta", {
+            waitUntil: "networkidle2",
+            timeout: 30000
+        });
+
+        console.log('Página cargada, buscando input...');
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Tomar screenshot para debug
+        const screenshot = await page.screenshot({ encoding: 'base64' });
+        console.log('Screenshot tomado, tamaño:', screenshot.length);
+
+        // Ver el HTML actual
+        const html = await page.content();
+        console.log('HTML length:', html.length);
+        console.log('Inputs encontrados:', (html.match(/<input/g) || []).length);
+
+        // Intentar llenar el input
+        const inputFilled = await page.evaluate((doc) => {
             const inputs = [...document.querySelectorAll('input')].filter(i => 
                 i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio'
             );
-            if (inputs[0]) {
+            console.log('Inputs visibles:', inputs.length);
+            if (inputs.length > 0) {
                 inputs[0].focus();
                 inputs[0].value = doc;
                 ['input','change','keyup'].forEach(ev => 
                     inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
                 );
+                return true;
             }
+            return false;
         }, documento);
 
-        await new Promise(r => setTimeout(r, 500));
+        console.log('Input llenado:', inputFilled);
+        await new Promise(r => setTimeout(r, 1000));
         await page.keyboard.press('Enter');
+        console.log('Enter presionado, esperando respuesta...');
 
-        // Esperar datos — máximo 18 segundos
+        // Esperar datos
         await new Promise((resolve) => {
             const interval = setInterval(() => {
                 if (simitData) { clearInterval(interval); resolve(); }
             }, 300);
-            setTimeout(() => { clearInterval(interval); resolve(); }, 18000);
+            setTimeout(() => { clearInterval(interval); resolve(); }, 20000);
         });
 
-        page.off('response', responseHandler);
+        console.log('URLs vistas:', urlsVistas.filter(u => u.includes('simit') || u.includes('fcm')));
         await page.close();
 
-        if (!simitData) return { ok: false, error: "SIMIT no respondió a tiempo" };
+        if (!simitData) {
+            return { ok: false, error: "SIMIT no respondió", urls: urlsVistas.slice(-10) };
+        }
 
         const rawData = simitData.data || simitData;
         const comparendos = (rawData.comparendos || []).map(c => ({
@@ -133,25 +162,8 @@ async function consultarSIMIT(documento) {
 
     } catch (error) {
         await page.close().catch(() => {});
-        // Si Chrome murió, reiniciarlo
         if (!browser.isConnected()) browser = null;
         throw error;
-    }
-}
-
-// Cola de consultas — procesar de a una para no sobrecargar
-async function processQueue() {
-    if (processing || queue.length === 0) return;
-    processing = true;
-    const { documento, resolve, reject } = queue.shift();
-    try {
-        const result = await consultarSIMIT(documento);
-        resolve(result);
-    } catch(e) {
-        reject(e);
-    } finally {
-        processing = false;
-        processQueue(); // Procesar siguiente
     }
 }
 
@@ -159,23 +171,15 @@ app.post("/api/simit", async (req, res) => {
     const documento = req.body.filtro || req.body.documento || req.body.placa;
     if (!documento) return res.status(400).json({ ok: false, error: "Documento requerido" });
 
-    // Agregar a la cola
-    const result = await new Promise((resolve, reject) => {
-        queue.push({ documento, resolve, reject });
-        processQueue();
-    }).catch(e => ({ ok: false, error: e.message }));
-
-    return res.json(result);
+    try {
+        const result = await consultarSIMIT(documento);
+        return res.json(result);
+    } catch(e) {
+        return res.status(500).json({ ok: false, error: e.message });
+    }
 });
 
-app.get("/", (req, res) => res.json({ 
-    status: "ok", 
-    message: "SIMIT Scraper v4 - Pool activo",
-    cola: queue.length,
-    chromeActivo: browser?.isConnected() || false
-}));
+app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper debug" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Scraper v4 en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Scraper debug en puerto ${PORT}`));
