@@ -34,6 +34,52 @@ async function getBrowser() {
 
 getBrowser().catch(console.error);
 
+function normalizarDatos(raw, documento) {
+    const comparendos = (raw.comparendos || []).map(c => ({
+        tipo: c.tipoComparendo || 'Comparendo',
+        numero_comparendo: c.numeroComparendo || c.numero || '',
+        fecha_comparendo: c.fechaImposicion || c.fecha || '',
+        placa: c.placa || '',
+        secretaria: c.secretariaNombre || c.secretaria || '',
+        infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
+        estado: c.estadoComparendo || c.estado || '',
+        valor: c.valorComparendo || c.valor || 0,
+        valor_a_pagar: c.valorAPagar || c.totalAPagar || c.valor || 0,
+        notificacion: c.notificacion || ''
+    }));
+
+    const multas = (raw.multas || []).map(m => ({
+        tipo: 'Multa',
+        numero_comparendo: m.numeroMulta || m.numero || '',
+        fecha_comparendo: m.fechaResolucion || m.fecha || '',
+        placa: m.placa || '',
+        secretaria: m.secretariaNombre || m.secretaria || '',
+        infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
+        estado: m.estadoMulta || m.estado || '',
+        valor: m.valorMulta || m.valor || 0,
+        valor_a_pagar: m.valorAPagar || m.totalAPagar || 0,
+        notificacion: ''
+    }));
+
+    const acuerdos = (raw.acuerdosPago || []).map(a => ({
+        numero_acuerdo: a.resolucion || '',
+        fecha_acuerdo: a.fechaResolucion ? a.fechaResolucion.split(' ')[0] : '',
+        secretaria: a.secretaria || '',
+        valor_acuerdo: a.valorAcuerdo || 0,
+        pendiente: a.pendiente || 0,
+        cuota: `${a.cantCuotasPendientes || 0} cuotas pendientes`,
+        valor_a_pagar: a.totalPagar || a.pendiente || 0
+    }));
+
+    // Si tiene acuerdos, devolverlos como tipo especial
+    if (acuerdos.length > 0 && comparendos.length === 0 && multas.length === 0) {
+        return { tipo: 'acuerdos', data: acuerdos, totalGeneral: raw.totalGeneral || 0 };
+    }
+
+    const resultados = [...comparendos, ...multas];
+    return { data: resultados, totalGeneral: raw.totalGeneral || 0 };
+}
+
 async function consultarSIMIT(documento) {
     const b = await getBrowser();
     const page = await b.newPage();
@@ -51,7 +97,7 @@ async function consultarSIMIT(documento) {
 
         page.on('response', async (response) => {
             const url = response.url();
-            if (url.includes('estadocuenta') || url.includes('consulta')) {
+            if (url.includes('consulta') || url.includes('estadocuenta')) {
                 try {
                     const ct = response.headers()['content-type'] || '';
                     if (ct.includes('json')) {
@@ -59,11 +105,8 @@ async function consultarSIMIT(documento) {
                         if (json && (
                             json.comparendos !== undefined ||
                             json.multas !== undefined ||
-                            (json.data && typeof json.data === 'object' && (
-                                json.data.comparendos !== undefined ||
-                                json.data.multas !== undefined ||
-                                json.data.cantMultasPagar !== undefined
-                            ))
+                            json.acuerdosPago !== undefined ||
+                            json.pazSalvo !== undefined
                         )) {
                             console.log('✅ Datos SIMIT interceptados');
                             simitData = json;
@@ -73,27 +116,20 @@ async function consultarSIMIT(documento) {
             }
         });
 
-        // Ir directo a la URL con el documento
         const url = `https://fcm.org.co/simit/#/estado-cuenta?documento=${documento}`;
-        console.log('Navegando a:', url);
-
         await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
         await new Promise(r => setTimeout(r, 3000));
 
-        // Ver si hay captcha
         const tieneCaptcha = await page.evaluate(() => {
-            return document.body.innerHTML.includes('captcha') || 
-                   document.body.innerHTML.includes('qxcaptcha') ||
+            return document.body.innerHTML.includes('qxcaptcha') ||
                    !!document.querySelector('iframe[src*="captcha"]');
         });
-        console.log('Tiene captcha:', tieneCaptcha);
 
         if (!tieneCaptcha) {
-            // Buscar y llenar el input
             await page.evaluate((doc) => {
                 const inputs = [...document.querySelectorAll('input')].filter(i =>
                     i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio' &&
-                    !i.name?.includes('email') && !i.name?.includes('password')
+                    !i.name?.includes('email') && !i.id?.includes('email')
                 );
                 if (inputs.length > 0) {
                     inputs[0].focus();
@@ -108,7 +144,6 @@ async function consultarSIMIT(documento) {
             await page.keyboard.press('Enter');
         }
 
-        // Esperar datos hasta 20 segundos
         await new Promise((resolve) => {
             const interval = setInterval(() => {
                 if (simitData) { clearInterval(interval); resolve(); }
@@ -119,41 +154,18 @@ async function consultarSIMIT(documento) {
         await page.close();
 
         if (!simitData) {
-            return { 
-                ok: false, 
-                error: tieneCaptcha ? "SIMIT bloqueó con CAPTCHA — intenta de nuevo en unos minutos" : "SIMIT no respondió a tiempo"
-            };
+            return { ok: false, error: tieneCaptcha ? "SIMIT bloqueó con CAPTCHA" : "SIMIT no respondió a tiempo" };
         }
 
-        const rawData = simitData.data || simitData;
-        const comparendos = (rawData.comparendos || []).map(c => ({
-            tipo: c.tipoComparendo || 'Comparendo',
-            numero_comparendo: c.numeroComparendo || '',
-            fecha_comparendo: c.fechaImposicion || '',
-            placa: c.placa || documento,
-            secretaria: c.secretaria || c.organismoTransito || '',
-            infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
-            estado: c.estadoComparendo || '',
-            valor: c.valorComparendo || 0,
-            valor_a_pagar: c.valorAPagar || c.totalAPagar || 0,
-            notificacion: c.notificacion || ''
-        }));
+        const normalizado = normalizarDatos(simitData, documento);
+        const resultados = normalizado.data || [];
+        const esAcuerdo = normalizado.tipo === 'acuerdos';
 
-        const multas = (rawData.multas || []).map(m => ({
-            tipo: 'Multa',
-            numero_comparendo: m.numeroMulta || '',
-            fecha_comparendo: m.fechaResolucion || '',
-            placa: m.placa || documento,
-            secretaria: m.secretaria || '',
-            infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
-            estado: m.estadoMulta || '',
-            valor: m.valorMulta || 0,
-            valor_a_pagar: m.valorAPagar || 0,
-            notificacion: ''
-        }));
+        if (esAcuerdo) {
+            return { ok: true, status: 'ok', tipo: 'acuerdos', data: normalizado.data, totalGeneral: normalizado.totalGeneral };
+        }
 
-        const resultados = [...comparendos, ...multas];
-        return { ok: true, status: resultados.length === 0 ? 'notfound' : 'ok', data: resultados };
+        return { ok: true, status: resultados.length === 0 ? 'notfound' : 'ok', data: resultados, totalGeneral: normalizado.totalGeneral };
 
     } catch (error) {
         await page.close().catch(() => {});
@@ -174,7 +186,7 @@ app.post("/api/simit", async (req, res) => {
     }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v5" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v6" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Scraper v5 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Scraper v6 en puerto ${PORT}`));
