@@ -22,100 +22,103 @@ app.post("/api/simit", async (req, res) => {
     try {
         browser = await puppeteer.launch({
             headless: "new",
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
+            args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         });
 
         const page = await browser.newPage();
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
+
+        // Interceptar la respuesta del SIMIT directamente
+        let simitData = null;
+        page.on('response', async (response) => {
+            const url = response.url();
+            if (url.includes('estadocuenta/consulta') || url.includes('simit/microservices')) {
+                try {
+                    const json = await response.json();
+                    simitData = json;
+                } catch(e) {}
+            }
+        });
 
         await page.goto("https://fcm.org.co/simit/#/estado-cuenta", {
             waitUntil: "networkidle2",
             timeout: 30000
         });
 
-        // Esperar el campo de búsqueda
-        await page.waitForSelector("#txtBusqueda, input[type='search'], input[placeholder*='placa'], input[placeholder*='cedula'], input[placeholder*='cédula']", { timeout: 15000 });
+        // Esperar campo de búsqueda
+        await page.waitForSelector('input', { timeout: 15000 });
 
-        // Llenar el campo
-        const input = await page.$("#txtBusqueda") ||
-                      await page.$("input[type='search']") ||
-                      await page.$("input[placeholder*='placa']") ||
-                      await page.$("input[placeholder*='cedula']");
+        // Encontrar y llenar el input
+        await page.evaluate((doc) => {
+            const inputs = document.querySelectorAll('input');
+            for (const input of inputs) {
+                if (input.type !== 'hidden' && input.type !== 'checkbox') {
+                    input.value = doc;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    break;
+                }
+            }
+        }, documento);
 
-        if (!input) throw new Error("No se encontró el campo de búsqueda");
+        await new Promise(r => setTimeout(r, 500));
 
-        await input.click({ clickCount: 3 });
-        await input.type(documento, { delay: 50 });
+        // Presionar Enter o click en buscar
+        await page.keyboard.press('Enter');
 
-        // Click en buscar
-        const btn = await page.$("button[type='submit'], .btn-buscar, #btnBuscar, button.search-btn");
-        if (btn) await btn.click();
-        else await page.keyboard.press("Enter");
-
-        // Esperar resultados
-        await page.waitForFunction(() => {
-            const body = document.body.innerText;
-            return body.includes("comparendo") || body.includes("multa") ||
-                   body.includes("paz y salvo") || body.includes("Paz y Salvo") ||
-                   body.includes("No se encontr") || body.includes("acuerdo");
-        }, { timeout: 20000 });
-
-        await new Promise(r => setTimeout(r, 2000));
-
-        // Extraer datos de la página
-        const resultado = await page.evaluate(() => {
-            const body = document.body.innerText;
-            const html = document.body.innerHTML;
-
-            // Buscar total a pagar
-            const totalMatch = body.match(/\$\s*[\d.,]+/g);
-            const pazSalvo = body.toLowerCase().includes("paz y salvo");
-
-            // Buscar tabla de comparendos
-            const rows = [];
-            document.querySelectorAll("table tr, .comparendo-item, .multa-item").forEach(row => {
-                rows.push(row.innerText.trim());
-            });
-
-            return {
-                texto: body.substring(0, 3000),
-                totales: totalMatch || [],
-                pazSalvo,
-                filas: rows.slice(0, 20)
-            };
-        });
+        // Esperar respuesta del API interceptada o timeout
+        await new Promise(r => setTimeout(r, 12000));
 
         await browser.close();
 
-        const status = resultado.pazSalvo ? "notfound" : "ok";
+        if (simitData) {
+            // Tenemos datos del API del SIMIT directamente
+            const rawData = simitData.data || simitData;
+            
+            // Normalizar comparendos
+            const comparendos = (rawData.comparendos || []).map(c => ({
+                tipo: c.tipoComparendo || c.tipo || 'Comparendo',
+                numero_comparendo: c.numeroComparendo || c.numero || '',
+                fecha_comparendo: c.fechaImposicion || c.fecha || '',
+                placa: c.placa || documento,
+                secretaria: c.secretaria || c.organismoTransito || '',
+                infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
+                estado: c.estadoComparendo || c.estado || '',
+                valor: c.valorComparendo || c.valor || 0,
+                valor_a_pagar: c.valorAPagar || c.totalAPagar || c.valor || 0,
+                notificacion: c.notificacion || ''
+            }));
 
-        return res.json({
-            ok: true,
-            status,
-            data: {
-                documento,
-                pazSalvo: resultado.pazSalvo,
-                totales: resultado.totales,
-                filas: resultado.filas,
-                resumen: resultado.texto.substring(0, 500)
-            }
-        });
+            // Normalizar multas
+            const multas = (rawData.multas || []).map(m => ({
+                tipo: 'Multa',
+                numero_comparendo: m.numeroMulta || m.numero || '',
+                fecha_comparendo: m.fechaResolucion || m.fecha || '',
+                placa: m.placa || documento,
+                secretaria: m.secretaria || '',
+                infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
+                estado: m.estadoMulta || m.estado || '',
+                valor: m.valorMulta || m.valor || 0,
+                valor_a_pagar: m.valorAPagar || m.totalAPagar || m.valor || 0,
+                notificacion: m.notificacion || ''
+            }));
+
+            const resultados = [...comparendos, ...multas];
+            const status = resultados.length === 0 ? 'notfound' : 'ok';
+
+            return res.json({ ok: true, status, data: resultados });
+        }
+
+        // Si no interceptamos datos, error
+        return res.status(500).json({ ok: false, error: "No se pudo obtener datos del SIMIT" });
 
     } catch (error) {
         if (browser) await browser.close();
-        return res.status(500).json({
-            ok: false,
-            error: "Error en scraping: " + error.message
-        });
+        return res.status(500).json({ ok: false, error: "Error: " + error.message });
     }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper activo" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v2" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Scraper corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Scraper v2 en puerto ${PORT}`));
