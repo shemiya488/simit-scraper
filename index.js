@@ -13,51 +13,32 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-let browser = null;
-
-async function getBrowser() {
-    if (!browser || !browser.isConnected()) {
-        browser = await puppeteer.launch({
-            headless: "new",
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1280,720"
-            ]
-        });
-    }
-    return browser;
-}
-
-getBrowser().catch(console.error);
+const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || "2UbuOKip5JmCrMVd94a87292d68376e6401d14430704fb4af";
 
 function normalizarDatos(raw, documento) {
     const comparendos = (raw.comparendos || []).map(c => ({
         tipo: c.tipoComparendo || 'Comparendo',
-        numero_comparendo: c.numeroComparendo || c.numero || '',
-        fecha_comparendo: c.fechaImposicion || c.fecha || '',
+        numero_comparendo: c.numeroComparendo || '',
+        fecha_comparendo: c.fechaImposicion || '',
         placa: c.placa || '',
         secretaria: c.secretariaNombre || c.secretaria || '',
         infraccion: c.codigoInfraccion ? `${c.codigoInfraccion}\n${c.descripcionInfraccion || ''}` : '',
-        estado: c.estadoComparendo || c.estado || '',
-        valor: c.valorComparendo || c.valor || 0,
-        valor_a_pagar: c.valorAPagar || c.totalAPagar || c.valor || 0,
+        estado: c.estadoComparendo || '',
+        valor: c.valorComparendo || 0,
+        valor_a_pagar: c.valorAPagar || c.totalAPagar || 0,
         notificacion: c.notificacion || ''
     }));
 
     const multas = (raw.multas || []).map(m => ({
         tipo: 'Multa',
-        numero_comparendo: m.numeroMulta || m.numero || '',
-        fecha_comparendo: m.fechaResolucion || m.fecha || '',
+        numero_comparendo: m.numeroMulta || '',
+        fecha_comparendo: m.fechaResolucion || '',
         placa: m.placa || '',
         secretaria: m.secretariaNombre || m.secretaria || '',
         infraccion: m.codigoInfraccion ? `${m.codigoInfraccion}\n${m.descripcionInfraccion || ''}` : '',
-        estado: m.estadoMulta || m.estado || '',
-        valor: m.valorMulta || m.valor || 0,
-        valor_a_pagar: m.valorAPagar || m.totalAPagar || 0,
+        estado: m.estadoMulta || '',
+        valor: m.valorMulta || 0,
+        valor_a_pagar: m.valorAPagar || 0,
         notificacion: ''
     }));
 
@@ -71,25 +52,22 @@ function normalizarDatos(raw, documento) {
         valor_a_pagar: a.totalPagar || a.pendiente || 0
     }));
 
-    // Si tiene acuerdos, devolverlos como tipo especial
     if (acuerdos.length > 0 && comparendos.length === 0 && multas.length === 0) {
         return { tipo: 'acuerdos', data: acuerdos, totalGeneral: raw.totalGeneral || 0 };
     }
 
-    const resultados = [...comparendos, ...multas];
-    return { data: resultados, totalGeneral: raw.totalGeneral || 0 };
+    return { data: [...comparendos, ...multas], totalGeneral: raw.totalGeneral || 0 };
 }
 
 async function consultarSIMIT(documento) {
-    const b = await getBrowser();
-    const page = await b.newPage();
+    // Conectar a Browserless
+    const browser = await puppeteer.connect({
+        browserWSEndpoint: `wss://production-sfo.browserless.io?token=${BROWSERLESS_TOKEN}`,
+    });
+
+    const page = await browser.newPage();
 
     try {
-        await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-CO', 'es'] });
-        });
-
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         await page.setViewport({ width: 1280, height: 720 });
 
@@ -116,34 +94,32 @@ async function consultarSIMIT(documento) {
             }
         });
 
-        const url = `https://fcm.org.co/simit/#/estado-cuenta?documento=${documento}`;
-        await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
-        await new Promise(r => setTimeout(r, 3000));
-
-        const tieneCaptcha = await page.evaluate(() => {
-            return document.body.innerHTML.includes('qxcaptcha') ||
-                   !!document.querySelector('iframe[src*="captcha"]');
+        await page.goto(`https://fcm.org.co/simit/#/estado-cuenta`, {
+            waitUntil: "networkidle2",
+            timeout: 30000
         });
 
-        if (!tieneCaptcha) {
-            await page.evaluate((doc) => {
-                const inputs = [...document.querySelectorAll('input')].filter(i =>
-                    i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio' &&
-                    !i.name?.includes('email') && !i.id?.includes('email')
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Llenar input
+        await page.evaluate((doc) => {
+            const inputs = [...document.querySelectorAll('input')].filter(i =>
+                i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio' &&
+                !i.id?.includes('email') && !i.name?.includes('email')
+            );
+            if (inputs.length > 0) {
+                inputs[0].focus();
+                inputs[0].value = doc;
+                ['input', 'change', 'keyup'].forEach(ev =>
+                    inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
                 );
-                if (inputs.length > 0) {
-                    inputs[0].focus();
-                    inputs[0].value = doc;
-                    ['input', 'change', 'keyup'].forEach(ev =>
-                        inputs[0].dispatchEvent(new Event(ev, { bubbles: true }))
-                    );
-                }
-            }, documento);
+            }
+        }, documento);
 
-            await new Promise(r => setTimeout(r, 500));
-            await page.keyboard.press('Enter');
-        }
+        await new Promise(r => setTimeout(r, 500));
+        await page.keyboard.press('Enter');
 
+        // Esperar datos
         await new Promise((resolve) => {
             const interval = setInterval(() => {
                 if (simitData) { clearInterval(interval); resolve(); }
@@ -152,24 +128,24 @@ async function consultarSIMIT(documento) {
         });
 
         await page.close();
+        await browser.disconnect();
 
         if (!simitData) {
-            return { ok: false, error: tieneCaptcha ? "SIMIT bloqueó con CAPTCHA" : "SIMIT no respondió a tiempo" };
+            return { ok: false, error: "SIMIT no respondió a tiempo" };
         }
 
         const normalizado = normalizarDatos(simitData, documento);
-        const resultados = normalizado.data || [];
-        const esAcuerdo = normalizado.tipo === 'acuerdos';
 
-        if (esAcuerdo) {
+        if (normalizado.tipo === 'acuerdos') {
             return { ok: true, status: 'ok', tipo: 'acuerdos', data: normalizado.data, totalGeneral: normalizado.totalGeneral };
         }
 
+        const resultados = normalizado.data || [];
         return { ok: true, status: resultados.length === 0 ? 'notfound' : 'ok', data: resultados, totalGeneral: normalizado.totalGeneral };
 
     } catch (error) {
         await page.close().catch(() => {});
-        if (browser && !browser.isConnected()) browser = null;
+        await browser.disconnect().catch(() => {});
         throw error;
     }
 }
@@ -186,7 +162,7 @@ app.post("/api/simit", async (req, res) => {
     }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper v6" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "SIMIT Scraper via Browserless" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Scraper v6 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Scraper Browserless en puerto ${PORT}`));
