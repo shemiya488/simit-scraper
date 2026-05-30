@@ -1,0 +1,14 @@
+{
+  "name": "simit-scraper",
+  "version": "1.0.0",
+  "description": "SIMIT scraper con Puppeteer",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "puppeteer": "^21.0.0"
+  }
+}
